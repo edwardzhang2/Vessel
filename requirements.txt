@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+scikit-learn
+joblib
+pillow
+pymupdf==1.24.9
+torch
+transformers==4.42.4
+accelerate
+safetensors
