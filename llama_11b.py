@@ -1,23 +1,84 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Vessel OCR via Llama 3.2 11B Vision — parallel, per-GPU processing.
+
+Key updates:
+- Model dir taken from env: LLAMA_MODEL_DIR (default: /models/Llama-3.2-11B-Vision-Instruct)
+- Force local load: local_files_only=True (no downloads)
+- Early SKIP_LLAMA stub path (no heavy imports if SKIP_LLAMA=1)
+"""
+
 import os
 import sys
-import subprocess
+import csv
 import time
+import subprocess
+from pathlib import Path
+
+# ---------------------------
+# Fast stub path for smoke tests (no heavy imports)
+# ---------------------------
+if os.environ.get("SKIP_LLAMA", "0") == "1":
+    # When called with SKIP_LLAMA=1, produce a stub results.csv and exit 0.
+    # Usage expected: python llama_11b.py <pdf_folder_path>
+    def _write_stub_results(input_folder: Path, out_path: Path):
+        # Headers expected by downstream extract_data.py
+        page1 = [f"Page1_Q{i}" for i in range(1, 12)]  # 11 items
+        page2 = [f"Page2_Q{i}" for i in range(1, 7)]   # 6 items
+        page3 = [f"Page3_Q{i}" for i in range(1, 4)]   # 3 items
+        headers = ["File"] + page1 + page2 + page3
+
+        pdfs = sorted(p for p in input_folder.iterdir() if p.suffix.lower() == ".pdf")
+        with out_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for pdf in pdfs:
+                w.writerow([str(pdf)] + [""] * (len(headers) - 1))
+        print(f"[llama_11b.py stub] Wrote {out_path} with {len(pdfs)} rows")
+
+    if len(sys.argv) < 2:
+        print("Usage: python llama_11b.py <pdf_folder_path>")
+        sys.exit(0)
+
+    in_dir = Path(sys.argv[1]).resolve()
+    if not in_dir.is_dir():
+        print(f"Error: '{in_dir}' is not a directory.")
+        sys.exit(0)
+
+    job_dir = in_dir.parent
+    _write_stub_results(in_dir, job_dir / "results.csv")
+    sys.exit(0)
+
+# ---------------------------
+# Heavy imports (only when not skipping)
+# ---------------------------
 import torch
-
-# Set PyTorch CUDA alloc config early to reduce fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 from PIL import Image
 from transformers import MllamaForConditionalGeneration, AutoProcessor
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import fitz
 import itertools
-import csv
+
+# ---------------------------
+# Config / defaults
+# ---------------------------
+# Make HF caches writable/isolated (harmless if unused)
+os.environ.setdefault("TRANSFORMERS_CACHE", "/cache")
+os.environ.setdefault("HF_HOME", "/cache")
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/cache")
+
+# Use env-provided model dir, default to mounted disk path
+LLAMA_MODEL_DIR = os.environ.get("LLAMA_MODEL_DIR", "/models/Llama-3.2-11B-Vision-Instruct")
+
 
 def print_gpu_usage():
+    """Print GPU utilization and VRAM usage using nvidia-smi (best effort)."""
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True,
         )
         print("GPU Usage:")
@@ -26,6 +87,7 @@ def print_gpu_usage():
             print(f"  GPU {index}: Utilization: {util}%  VRAM Used: {mem_used} MiB / {mem_total} MiB")
     except Exception as e:
         print(f"Warning: Could not get GPU usage info via nvidia-smi: {e}")
+
 
 def ask_single_question_on_device(model, processor, image, question, device_id):
     device = torch.device(f"cuda:{device_id}")
@@ -66,18 +128,6 @@ def ask_single_question_on_device(model, processor, image, question, device_id):
         print(f"Unexpected error on question '{question}': {e}")
         return question, f"Error: {e}", 0
 
-def load_model_on_device(model_path, device_id):
-    device = torch.device(f"cuda:{device_id}")
-    print(f"Loading model on GPU {device_id}...")
-    model = MllamaForConditionalGeneration.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map=None
-    )
-    model.to(device)
-    model.eval()
-    print(f"Model loaded on GPU {device_id}.")
-    return model
 
 def pdf_page_to_image(pdf_path, page_number, max_size=560):
     doc = fitz.open(pdf_path)
@@ -92,6 +142,7 @@ def pdf_page_to_image(pdf_path, page_number, max_size=560):
         image = image.resize(new_size)
     return image
 
+
 def write_results_to_csv(filepath, results, headers):
     with open(filepath, "w", newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -99,31 +150,37 @@ def write_results_to_csv(filepath, results, headers):
         for row in results:
             writer.writerow(row)
 
+
 def get_pdf_files_from_folder(folder_path):
     supported = ('.pdf',)
     return [os.path.join(folder_path, fname) for fname in os.listdir(folder_path) if fname.lower().endswith(supported)]
 
-def clean_llm_response(question, raw_text):
+
+def clean_llm_response(_question, raw_text):
     return raw_text.strip()
+
 
 def process_single_pdf(pdf_file, model_path, max_size, all_questions_per_page, device_id):
     """
     Process one PDF file: load model on device, process each page and its questions in parallel threads,
-    and return answers.
+    and return answers. This runs in a subprocess (spawned by ProcessPoolExecutor).
     """
-    import torch
-    import fitz
-    from PIL import Image
-    from transformers import MllamaForConditionalGeneration, AutoProcessor
+    import torch as _torch
+    import fitz as _fitz
+    from PIL import Image as _Image
+    from transformers import MllamaForConditionalGeneration as _Mllama, AutoProcessor as _AutoProcessor
 
-    device = torch.device(f"cuda:{device_id}")
-    processor = AutoProcessor.from_pretrained(model_path)
+    device = _torch.device(f"cuda:{device_id}")
+
+    # Local-only load from the mounted directory
+    processor = _AutoProcessor.from_pretrained(model_path, local_files_only=True)
 
     print(f"[{pdf_file}] Loading model on GPU {device_id} in subprocess...")
-    model = MllamaForConditionalGeneration.from_pretrained(
+    model = _Mllama.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
-        device_map=None
+        torch_dtype=_torch.bfloat16,
+        device_map=None,            # keep None; we place the whole model on this single device
+        local_files_only=True,
     )
     model.to(device)
     model.eval()
@@ -156,7 +213,7 @@ def process_single_pdf(pdf_file, model_path, max_size, all_questions_per_page, d
             for future in as_completed(futures):
                 i = futures[future]
                 try:
-                    question, answer, duration = future.result()
+                    _q, answer, duration = future.result()
                 except Exception as e:
                     answer = f"Error: {e}"
                     duration = 0
@@ -173,6 +230,7 @@ def process_single_pdf(pdf_file, model_path, max_size, all_questions_per_page, d
         return pdf_file, []
 
     return pdf_file, all_answers
+
 
 def process_pdfs(pdf_files, model_path, max_size, all_questions_per_page, gpu_cycle, max_workers):
     """
@@ -214,18 +272,19 @@ def process_pdfs(pdf_files, model_path, max_size, all_questions_per_page, gpu_cy
 
     return results, failed_files
 
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python process_folder_of_pdfs_parallel.py <pdf_folder_path>")
+        print("Usage: python llama_11b.py <pdf_folder_path>")
         return
 
     input_folder = sys.argv[1]
-
     if not os.path.isdir(input_folder):
         print("Error: Input path is not a directory.")
         return
 
-    model_path = "./Llama-3.2-11B-Vision-Instruct"
+    # Load model path from env (mounted disk) and keep images small-ish
+    model_path = LLAMA_MODEL_DIR
     max_size = 560
 
     pdf_files = get_pdf_files_from_folder(input_folder)
@@ -239,7 +298,7 @@ def main():
         return
     print(f"Number of GPUs available: {num_gpus}")
 
-    # Updated prompts for items 12, 13, 14 to detect handwriting presence as YES or NO
+    # Prompts
     page1_questions = [
         "Based on the image above, output only the name of vessel and nothing else.",
         "Based on the image above, output only the call sign of vessel and nothing else.",
@@ -271,15 +330,13 @@ def main():
 
     csv_headers = ['File'] + [f"Page{p + 1}_Q{i + 1}" for p, page_qs in enumerate(all_questions_per_page) for i in range(len(page_qs))]
 
-    # Round robin GPU assignment iterator
+    # Round-robin GPU assignment
     gpu_cycle = itertools.cycle(range(num_gpus))
 
-    # Initial max_workers (concurrent processes)
+    # Number of concurrent processes
     max_workers = min(num_gpus, len(pdf_files))
 
     print("Starting parallel PDF processing on available GPUs...")
-
-    # Initial full batch processing
     results, failed = process_pdfs(pdf_files, model_path, max_size, all_questions_per_page, gpu_cycle, max_workers)
 
     MAX_RETRIES = 3
@@ -289,16 +346,9 @@ def main():
     while failed and retry_count < MAX_RETRIES:
         retry_count += 1
         print(f"\nRetry attempt {retry_count} for {len(failed)} failed/skipped PDFs...")
-
-        # Optional delay to help with GPU memory cleanup
-        time.sleep(5)
-
-        # Reset GPU cycle for retry
+        time.sleep(5)  # allow some memory cleanup
         gpu_cycle = itertools.cycle(range(num_gpus))
-        
         retry_results, failed = process_pdfs(failed, model_path, max_size, all_questions_per_page, gpu_cycle, max_workers)
-
-        # Append retry results
         results.extend(retry_results)
 
     if failed:
@@ -306,20 +356,20 @@ def main():
         for fpdf in failed:
             print(f" - {fpdf}")
 
-    # Sort results by filename
+    # Sort and write CSV
     results.sort(key=lambda x: x[0])
-
-    # Prepare CSV rows, padding empty answers for failed files
     total_questions = sum(len(qs) for qs in all_questions_per_page)
-    csv_rows = []
+
+    rows = []
     for pdf_file, answers in results:
         if len(answers) < total_questions:
             answers += [""] * (total_questions - len(answers))
-        csv_rows.append([pdf_file] + answers)
+        rows.append([pdf_file] + answers)
 
-    write_results_to_csv("results.csv", csv_rows, csv_headers)
+    write_results_to_csv("results.csv", rows, csv_headers)
     print("\nAll PDFs processed. Results saved to 'results.csv'.")
     print_gpu_usage()
+
 
 if __name__ == "__main__":
     main()

@@ -49,7 +49,7 @@ a:hover{text-decoration:underline}
         <button type="submit">⏫ Upload &amp; Process</button>
       </form>
       <p class="help">Need API docs? See <a href="/docs" target="_blank">/docs</a>. Health check: <a href="/health" target="_blank">/health</a>.</p>
-      <div class="footer">Runs on HPCaaS. Ensure model artifacts are mounted at <code>/models</code> for full classification.</div>
+      <div class="footer">Runs on HKSTP's HPCaaS. Ensure model artifacts are mounted at <code>/models</code> for full classification.</div>
     </div>
   </div>
 </body>
