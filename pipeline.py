@@ -1,56 +1,96 @@
-# pipeline.py (PATCH)
+# pipeline.py
 import os
 import sys
 import subprocess
 import argparse
 import uuid
-import time
+from pathlib import Path
 
-def run_llama(input_path):
-    print(f"Running llama_11B.py on input: {input_path} ...")
-    cmd = [sys.executable, "llama_11B.py", input_path]
-    subprocess.run(cmd, check=True)
-    print("llama_11B.py completed. 'results.csv' generated.")
+# Resolve the directory that contains this file (/app inside the image)
+APP_DIR = Path(__file__).resolve().parent
 
-def run_extract_data():
-    print("Running extract_data.py ...")
-    cmd = [sys.executable, "extract_data.py"]
-    subprocess.run(cmd, check=True)
-    print("extract_data.py completed. 'input.csv' generated.")
+# Script paths (match your actual filenames)
+LLAMA_SCRIPT = APP_DIR / "llama_11b.py"        # NOTE: lowercase 'b' per your tree
+EXTRACT_SCRIPT = APP_DIR / "extract_data.py"
+CLASSIFY_SCRIPT = APP_DIR / "classify.py"
 
-def run_classify():
+# Allow model paths to come from env (with sensible defaults)
+MODEL_PATH = os.environ.get("MODEL_PATH", "/models/model.joblib")
+FEATURES_PATH = os.environ.get("FEATURES_PATH", "/models/feature_columns.joblib")
+
+
+def run_llama(input_path: str):
+    """
+    Run llama_11b.py against the input folder of PDFs.
+    We run with cwd=<job_dir> so results.csv is written into that job folder.
+    """
+    job_dir = Path(input_path).resolve().parent
+    if not LLAMA_SCRIPT.exists():
+        raise FileNotFoundError(f"LLaMA script not found at {LLAMA_SCRIPT}")
+    cmd = [sys.executable, str(LLAMA_SCRIPT), input_path]
+    subprocess.run(cmd, check=True, cwd=str(job_dir))
+
+
+def run_extract_data(job_dir: Path):
+    """
+    Run extract_data.py in job_dir; it reads results.csv and writes input.csv there.
+    """
+    if not EXTRACT_SCRIPT.exists():
+        raise FileNotFoundError(f"extract_data.py not found at {EXTRACT_SCRIPT}")
+    cmd = [sys.executable, str(EXTRACT_SCRIPT)]
+    subprocess.run(cmd, check=True, cwd=str(job_dir))
+
+
+def run_classify(job_dir: Path) -> str:
+    """
+    Run classify.py on input.csv in job_dir; returns the output CSV filename.
+    """
+    if not CLASSIFY_SCRIPT.exists():
+        raise FileNotFoundError(f"classify.py not found at {CLASSIFY_SCRIPT}")
+
     input_csv = "input.csv"
     output_csv = f"output_{uuid.uuid4().hex[:8]}.csv"
 
-    # NEW: read from env, fall back to container defaults under /models
-    model_path = os.getenv("MODEL_PATH", "/models/model.joblib")
-    features_path = os.getenv("FEATURES_PATH", "/models/feature_columns.joblib")
-
-    print(f"Running classify.py on {input_csv} ...")
     cmd = [
-        sys.executable, "classify.py",
-        input_csv, output_csv,
-        "--model_path", model_path,
-        "--features_path", features_path,
+        sys.executable,
+        str(CLASSIFY_SCRIPT),
+        input_csv,
+        output_csv,
+        "--model_path",
+        MODEL_PATH,
+        "--features_path",
+        FEATURES_PATH,
     ]
-    subprocess.run(cmd, check=True)
-    print(f"classify.py completed. Output saved to '{output_csv}'")
+    subprocess.run(cmd, check=True, cwd=str(job_dir))
     return output_csv
 
-def pipeline(input_path):
+
+def pipeline(input_path: str) -> str:
+    """
+    Full pipeline:
+      1) LLaMA extraction -> results.csv (in job_dir)
+      2) Data extraction -> input.csv (in job_dir)
+      3) Classification -> output_<id>.csv (in job_dir)
+    Returns absolute path to the final output CSV.
+    """
+    job_dir = Path(input_path).resolve().parent
+
+    # Step 1
     run_llama(input_path)
-    run_extract_data()
-    output_csv = run_classify()
-    return output_csv
+
+    # Step 2
+    run_extract_data(job_dir)
+
+    # Step 3
+    output_csv_name = run_classify(job_dir)
+
+    return str(job_dir / output_csv_name)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run full berth classification pipeline on PDF(s)")
     parser.add_argument("input_path", help="Path to input PDF file or folder of PDFs")
     args = parser.parse_args()
 
-    start_time = time.time()
     final_csv = pipeline(args.input_path)
-    elapsed = time.time() - start_time
-
     print(f"\nPipeline completed successfully! Final classified CSV: {final_csv}")
-    print(f"Total elapsed time: {elapsed:.2f} seconds")
