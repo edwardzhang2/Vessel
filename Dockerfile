@@ -1,38 +1,33 @@
-# --- GPU-enabled base with PyTorch + CUDA already installed ---
-# If this tag doesn't match your cluster drivers, switch to a nearby CUDA tag.
+# Dockerfile (GPU)
+# Base: PyTorch with CUDA so torch+CUDA are preinstalled
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
-# --- Environment: make HF cache writable; speed up Python; saner pip ---
+# --- Env & caching ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TRANSFORMERS_CACHE=/app/hf_cache \
-    HF_HOME=/app/hf_cache \
-    HUGGINGFACE_HUB_CACHE=/app/hf_cache \
-    SKIP_LLAMA=0
+    HF_HOME=/cache \
+    HUGGINGFACE_HUB_CACHE=/cache
 
-# Create/writeable cache directory
-RUN mkdir -p /app/hf_cache
-
-# System deps you actually need (keep this minimal to speed builds)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Workdir
 WORKDIR /app
 
-# --- Install Python deps (force upgrade to avoid old cached versions) ---
-# Copy ONLY requirements first to leverage layer caching on future builds
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade --no-cache-dir -r /app/requirements.txt
+# Install system deps first (cached layer)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# --- Copy your application code ---
+# Copy only requirements first (to leverage Docker layer cache)
+COPY requirements.txt /app/requirements.txt
+
+# Install Python deps (pin transformers to >=4.44.* which has AutoModelForVision2Seq)
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy the rest of the app
 COPY . /app
 
-# Expose API port
-EXPOSE 8080
+# Create writable cache dirs (in case you forget to mount /cache)
+RUN mkdir -p /cache && chmod -R 777 /cache
 
-# Default command: run FastAPI server
-# (If you prefer to override in HPCaaS UI, you can leave it.)
+EXPOSE 8080
+# Start the API
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
