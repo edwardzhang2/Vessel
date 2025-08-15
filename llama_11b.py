@@ -4,10 +4,13 @@
 """
 Vessel OCR via Llama 3.2 11B Vision — parallel, per-GPU processing.
 
-Key updates:
-- Model dir taken from env: LLAMA_MODEL_DIR (default: /models/Llama-3.2-11B-Vision-Instruct)
-- Force local load: local_files_only=True (no downloads)
-- Early SKIP_LLAMA stub path (no heavy imports if SKIP_LLAMA=1)
+What you get here:
+- Recursive PDF discovery (works with nested folders inside uploaded ZIPs)
+- Clear logging of how many PDFs were found and which ones
+- Env-driven model directory (LLAMA_MODEL_DIR), default: /models/Llama-3.2-11B-Vision-Instruct
+- Local-only model & processor load (local_files_only=True). No online downloads.
+- Optional SKIP_LLAMA=1 stub mode that writes a valid results.csv with 1 row per PDF (blank answers)
+- Parallel per-GPU processing using ProcessPoolExecutor + per-page ThreadPoolExecutor
 """
 
 import os
@@ -15,14 +18,13 @@ import sys
 import csv
 import time
 import subprocess
+import itertools
 from pathlib import Path
 
 # ---------------------------
-# Fast stub path for smoke tests (no heavy imports)
+# Quick STUB path (for smoke tests) — set SKIP_LLAMA=1
 # ---------------------------
 if os.environ.get("SKIP_LLAMA", "0") == "1":
-    # When called with SKIP_LLAMA=1, produce a stub results.csv and exit 0.
-    # Usage expected: python llama_11b.py <pdf_folder_path>
     def _write_stub_results(input_folder: Path, out_path: Path):
         # Headers expected by downstream extract_data.py
         page1 = [f"Page1_Q{i}" for i in range(1, 12)]  # 11 items
@@ -30,13 +32,17 @@ if os.environ.get("SKIP_LLAMA", "0") == "1":
         page3 = [f"Page3_Q{i}" for i in range(1, 4)]   # 3 items
         headers = ["File"] + page1 + page2 + page3
 
-        pdfs = sorted(p for p in input_folder.iterdir() if p.suffix.lower() == ".pdf")
+        pdfs = sorted(input_folder.rglob("*.pdf"))
+        print(f"[llama:stub] Found {len(pdfs)} PDF(s) under '{input_folder}'.")
+        for p in pdfs[:10]:
+            print(f"[llama:stub] - {p}")
+
         with out_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(headers)
             for pdf in pdfs:
                 w.writerow([str(pdf)] + [""] * (len(headers) - 1))
-        print(f"[llama_11b.py stub] Wrote {out_path} with {len(pdfs)} rows")
+        print(f"[llama:stub] Wrote {out_path} with {len(pdfs)} data row(s).")
 
     if len(sys.argv) < 2:
         print("Usage: python llama_11b.py <pdf_folder_path>")
@@ -47,8 +53,8 @@ if os.environ.get("SKIP_LLAMA", "0") == "1":
         print(f"Error: '{in_dir}' is not a directory.")
         sys.exit(0)
 
-    job_dir = in_dir.parent
-    _write_stub_results(in_dir, job_dir / "results.csv")
+    out_file = Path.cwd() / "results.csv"
+    _write_stub_results(in_dir, out_file)
     sys.exit(0)
 
 # ---------------------------
@@ -59,7 +65,6 @@ from PIL import Image
 from transformers import MllamaForConditionalGeneration, AutoProcessor
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import fitz
-import itertools
 
 # ---------------------------
 # Config / defaults
@@ -121,11 +126,11 @@ def ask_single_question_on_device(model, processor, image, question, device_id):
         return question, output_text, duration
 
     except torch.cuda.OutOfMemoryError as oom:
-        print(f"CUDA OOM error on question '{question}': {oom}")
+        print(f"[llama] CUDA OOM on question '{question}': {oom}")
         torch.cuda.empty_cache()
         return question, "Error: CUDA Out Of Memory", 0
     except Exception as e:
-        print(f"Unexpected error on question '{question}': {e}")
+        print(f"[llama] Unexpected error on question '{question}': {e}")
         return question, f"Error: {e}", 0
 
 
@@ -152,8 +157,13 @@ def write_results_to_csv(filepath, results, headers):
 
 
 def get_pdf_files_from_folder(folder_path):
-    supported = ('.pdf',)
-    return [os.path.join(folder_path, fname) for fname in os.listdir(folder_path) if fname.lower().endswith(supported)]
+    """Recursive scan for PDFs (handles nested folders inside a ZIP)."""
+    pdfs = []
+    for root, _, files in os.walk(folder_path):
+        for fname in files:
+            if fname.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(root, fname))
+    return pdfs
 
 
 def clean_llm_response(_question, raw_text):
@@ -166,8 +176,8 @@ def process_single_pdf(pdf_file, model_path, max_size, all_questions_per_page, d
     and return answers. This runs in a subprocess (spawned by ProcessPoolExecutor).
     """
     import torch as _torch
-    import fitz as _fitz
     from PIL import Image as _Image
+    import fitz as _fitz
     from transformers import MllamaForConditionalGeneration as _Mllama, AutoProcessor as _AutoProcessor
 
     device = _torch.device(f"cuda:{device_id}")
@@ -221,7 +231,7 @@ def process_single_pdf(pdf_file, model_path, max_size, all_questions_per_page, d
                 cleaned = clean_llm_response(questions[i], answer)
                 page_answers[i] = cleaned
 
-                print(f"[{pdf_file}] Page {page_num + 1} Question {i + 1} answered in {duration:.2f}s")
+                print(f"[{pdf_file}] Page {page_num + 1} Q{i + 1} answered in {duration:.2f}s")
 
         all_answers.extend(page_answers)
 
@@ -280,7 +290,7 @@ def main():
 
     input_folder = sys.argv[1]
     if not os.path.isdir(input_folder):
-        print("Error: Input path is not a directory.")
+        print(f"Error: Input path is not a directory: {input_folder}")
         return
 
     # Load model path from env (mounted disk) and keep images small-ish
@@ -288,8 +298,17 @@ def main():
     max_size = 560
 
     pdf_files = get_pdf_files_from_folder(input_folder)
+    print(f"[llama] Scanned '{input_folder}', found {len(pdf_files)} PDF(s).")
+    for p in pdf_files[:10]:
+        print(f"[llama] - {p}")
     if not pdf_files:
-        print("No PDF files found in the folder.")
+        print("[llama] No PDF files found. Writing empty results.csv with header only.")
+        # Write header-only results to keep pipeline moving
+        page1 = [f"Page1_Q{i}" for i in range(1, 12)]
+        page2 = [f"Page2_Q{i}" for i in range(1, 7)]
+        page3 = [f"Page3_Q{i}" for i in range(1, 4)]
+        headers = ["File"] + page1 + page2 + page3
+        write_results_to_csv("results.csv", [], headers)
         return
 
     num_gpus = torch.cuda.device_count()
@@ -367,7 +386,7 @@ def main():
         rows.append([pdf_file] + answers)
 
     write_results_to_csv("results.csv", rows, csv_headers)
-    print("\nAll PDFs processed. Results saved to 'results.csv'.")
+    print(f"[llama] Saved results.csv with {len(rows)} data row(s).")
     print_gpu_usage()
 
 
