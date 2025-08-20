@@ -6,9 +6,9 @@ import shutil
 import os
 import zipfile
 import subprocess
-import glob
 from pathlib import Path
 import sys
+from typing import Optional
 
 app = FastAPI(title="Vessel OCR & Classification API")
 
@@ -42,14 +42,14 @@ a:hover{text-decoration:underline}
   <div class="container">
     <div class="card">
       <h1>Vessel OCR & Classification</h1>
-      <p class="sub">Upload a <b>.zip</b> containing one or more PDFs. The pipeline will extract handwriting, normalize fields, and return a <b>CSV</b> with classifications.</p>
+      <p class="sub">Upload a <b>.zip</b> containing one or more PDFs. The pipeline will extract handwriting, normalize fields, and return a <b>ZIP</b> of artifacts (preferred) or a <b>CSV</b> if a ZIP is not available.</p>
       <form action="/upload/" method="post" enctype="multipart/form-data">
         <label for="file">ZIP of PDFs</label>
         <input id="file" type="file" name="file" accept=".zip" required>
         <button type="submit">⏫ Upload &amp; Process</button>
       </form>
       <p class="help">Need API docs? See <a href="/docs" target="_blank">/docs</a>. Health check: <a href="/health" target="_blank">/health</a>.</p>
-      <div class="footer">Runs on HKSTP's HPCaaS. Ensure model artifacts are mounted at <code>/models</code> for full classification.</div>
+      <div class="footer">Runs on HKSTP's HPCaaS. Ensure model artifacts are mounted at <code>/models</code>.</div>
     </div>
   </div>
 </body>
@@ -62,6 +62,57 @@ def root():
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     return "ok"
+
+def _pick_artifact(job_dir: Path) -> Path:
+    """
+    Prefer a packaged ZIP produced by the pipeline.
+    Fall back to output_*.csv, then results.csv.
+    """
+    zips = sorted(job_dir.glob("job_artifacts_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if zips:
+        return zips[0]
+
+    csvs = sorted(job_dir.glob("output_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if csvs:
+        return csvs[0]
+
+    results = job_dir / "results.csv"
+    if results.exists():
+        return results
+
+    raise FileNotFoundError(f"No artifact found in {job_dir}")
+
+def _media_type_for(path: Path) -> str:
+    if path.suffix.lower() == ".zip":
+        return "application/zip"
+    # default for csv (output_*.csv or results.csv)
+    return "text/csv"
+
+def _zip_contains(zip_path: Path, member_name: str) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return member_name in zf.namelist()
+    except Exception:
+        return False
+
+def _ensure_input_in_zip(zip_path: Path, job_dir: Path) -> None:
+    """
+    If job_artifacts_*.zip exists but doesn't contain input.csv,
+    append input.csv from the job_dir (if present).
+    """
+    input_csv = job_dir / "input.csv"
+    if not input_csv.exists():
+        return
+    if _zip_contains(zip_path, "input.csv"):
+        return
+    # Append input.csv into the existing zip
+    try:
+        with zipfile.ZipFile(zip_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(input_csv, arcname="input.csv")
+    except Exception as e:
+        # Non-fatal: if appending fails, we still return the original artifact
+        # You could log this to stdout/stderr if desired.
+        pass
 
 @app.post("/upload/")
 async def upload_pdf_zip(file: UploadFile = File(...)):
@@ -100,26 +151,30 @@ async def upload_pdf_zip(file: UploadFile = File(...)):
         )
 
         if proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Pipeline failed:\n{proc.stderr}")
+            # Pass through pipeline stdout in the error for easier debugging
+            raise HTTPException(status_code=500, detail=f"Pipeline failed:\n{proc.stderr or proc.stdout}")
 
-        # Find the output CSV produced by pipeline (output_*.csv)
-        outputs = sorted(job_dir.glob("output_*.csv"))
-        if not outputs:
-            # Fallback to results.csv if needed
-            results = job_dir / "results.csv"
-            if results.exists():
-                outputs = [results]
-
-        if not outputs:
+        # Prefer ZIP, then CSVs
+        try:
+            artifact = _pick_artifact(job_dir)
+        except FileNotFoundError:
             raise HTTPException(
                 status_code=500,
-                detail=f"No output CSV found in {job_dir}.\nStdout:\n{proc.stdout}\nStderr:\n{proc.stderr}"
+                detail=f"No artifact found in {job_dir}.\nStdout:\n{proc.stdout}\nStderr:\n{proc.stderr}"
             )
 
-        out_csv = outputs[-1]
-        return FileResponse(path=str(out_csv), filename=out_csv.name, media_type="text/csv")
+        # If artifact is a ZIP, make sure input.csv is inside (append if missing)
+        if artifact.suffix.lower() == ".zip":
+            _ensure_input_in_zip(artifact, job_dir)
+
+        media_type = _media_type_for(artifact)
+        return FileResponse(
+            path=str(artifact),
+            filename=artifact.name,
+            media_type=media_type,
+        )
 
     finally:
-        # To keep artifacts for debugging, comment the next line out.
+        # Keep artifacts for debugging. Uncomment to auto-clean:
         # shutil.rmtree(job_dir, ignore_errors=True)
         pass
