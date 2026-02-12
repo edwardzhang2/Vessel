@@ -1,4 +1,3 @@
-# pipeline.py
 import os
 import sys
 import subprocess
@@ -19,9 +18,9 @@ CLASSIFY_SCRIPT = APP_DIR / "classify.py"
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/model.joblib")
 FEATURES_PATH = os.environ.get("FEATURES_PATH", "/models/feature_columns.joblib")
 
-# Prefer zipping over loose CSVs (keeps server from picking CSV)
+# prefer zipping over loose CSVs (to keep server from picking CSV)
 PREFER_ZIP = os.environ.get("PIPELINE_PREFER_ZIP", "1") not in ("0", "false", "False")
-# Remove loose CSVs after zipping (but keep them *inside* the ZIP)
+# remove loose CSVs after zipping (but keep them *inside* the ZIP)
 CLEAN_AFTER_ZIP = os.environ.get("PIPELINE_CLEAN_AFTER_ZIP", "1") not in ("0", "false", "False")
 
 # ---------- logging ----------
@@ -43,13 +42,17 @@ def _run_and_capture(step_name: str, cmd: list[str], cwd: Path, pipeline_log: Pa
     _log_block(pipeline_log, f"[{step_name}] START", "")
     _log_line(pipeline_log, f"[{step_name}] CWD: {cwd}")
     _log_line(pipeline_log, f"[{step_name}] CMD: {' '.join(cmd)}")
+    # log the environment variables
     for k in ("LLAMA_MODEL_DIR", "HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "SKIP_LLAMA"):
         if env and k in env:
+            # log the environment variable if it is set in the environment
             _log_line(pipeline_log, f"[{step_name}] ENV {k}={env[k]}")
         elif k in os.environ:
+            # log the environment variable if it is set in the os environment
             _log_line(pipeline_log, f"[{step_name}] ENV {k}={os.environ[k]}")
 
     try:
+        # use subprocess becuase if it crashes, the pipeline will still continue
         proc = subprocess.run(
             cmd, cwd=str(cwd), env=env if env is not None else None,
             capture_output=True, text=True, check=False,
@@ -139,7 +142,7 @@ def _zip_outputs(job_dir: Path, pipeline_log: Path) -> Path:
     _copy_worker_logs_into_job(job_dir, pipeline_log)
     zip_name = f"job_artifacts_{uuid.uuid4().hex[:8]}.zip"
     zip_path = job_dir / zip_name
-    patterns = ["results*.csv", "output_*.csv", "pipeline.log", "llama_11b_*.log"]
+    patterns = ["results*.csv", "input.csv", "output_*.csv", "pipeline.log", "llama_11b_*.log"]
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         added_any = False

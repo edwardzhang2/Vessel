@@ -1,18 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import csv
 import re
 import os
 from copy import deepcopy
 
-# Canonical cargo types as per your list (uppercase to match synthetic data)
 CARGO_TYPES = [
     'CONTAINER', 'BULK/WOODCHIP/CEMENT/ORE', 'TANKER_CRUDE_FUEL',
     'TANKER_LNG', 'CHEMICAL', 'GENERAL'
 ]
 
-# Map full country names to abbreviations
+# map full country names to abbreviations
 FLAG_ABBREVIATIONS = {
     'LIBERIA': 'LIB',
     'HONG KONG': 'HKG',
@@ -33,7 +29,7 @@ FLAG_ABBREVIATIONS = {
 # ---------- general cleaners ----------
 
 def clean_value(val):
-    """Generic trim: strip spaces, remove **surrounding**, and a single trailing period."""
+    # generic trim: strip spaces, remove **surrounding**, and a single trailing period
     if not isinstance(val, str):
         return val
     v = val.strip()
@@ -46,6 +42,7 @@ def clean_value(val):
 def parse_float_safe(ans):
     if not ans or not isinstance(ans, str):
         return None
+    # extract the number from the string
     match = re.search(r"[-+]?\d*\.\d+|\d+", ans.replace(',', ''))
     if match:
         try:
@@ -64,12 +61,19 @@ def special_bool_field(ans):
     elif ans_clean == "no":
         return False
 
-    empty = {'no', 'none', 'blank', 'n/a', 'na', '', 'n/a.', 'blank.', '**blank**', '**n/a**'}
-    for word in ans_clean.split():
-        if word in empty:
-            return False
+    # treat common empty-ish / negative tokens as false
+    empty = {'no', 'n', 'none', 'blank', 'n/a', 'na', '0', '', 'n/a.', 'blank.', '**blank**', '**n/a**'}
+    tokens = set(ans_clean.replace("/", " ").replace(",", " ").split())
+    if tokens & empty:
+        return False
+
+    # if the model gives uncertain language, default to False, safer than false positives
+    uncertain = {'unknown', 'unclear', 'illegible', 'unable', 'not', 'cannot'}
+    if tokens & uncertain:
+        return False
 
     return True
+
 
 def normalize_cargo_type(raw_cargo):
     if not raw_cargo or not isinstance(raw_cargo, str):
@@ -93,10 +97,10 @@ def normalize_flag(raw_flag):
             return abbrev
     return flag_upper if flag_upper else None
 
-# ---------- MD538 filtering & remap ----------
+# MD538 filtering & remap
 
 def _formtype_key(rows):
-    """Return the actual key name used for FormType, if any."""
+    # return the actual key name used for FormType, if any
     if not rows:
         return None
     for k in rows[0].keys():
@@ -105,12 +109,12 @@ def _formtype_key(rows):
     return None
 
 def _filter_md538_rows(rows):
-    """Return only rows that are MD538 (based on 'FormType' column if present)."""
+    # return only rows that are MD538 (based on 'FormType' column if present)
     if not rows:
         return rows
     form_key = _formtype_key(rows)
     if form_key is None:
-        # Backward compatibility: treat all rows as MD538
+        # backward compatibility: treat all rows as MD538
         return rows
     md538 = []
     for r in rows:
@@ -122,20 +126,18 @@ def _filter_md538_rows(rows):
 PAGE_Q_RE = re.compile(r"^Page(\d+)_Q(\d+)$", re.IGNORECASE)
 
 def remap_to_md538_headers(row):
-    """
-    Create a dict that:
-      - Preserves metadata (File, FormType, Filename) when present
-      - Adds MD538_P{page}_Q{q} for every Page{page}_Q{q} key
-      - Preserves any other non-empty extra fields
-    """
+    # create a dict that:
+    #   - preserves metadata (File, FormType, Filename) when present
+    #   - adds MD538_P{page}_Q{q} for every Page{page}_Q{q} key
+    #   - preserves any other non-empty extra fields
     out = {}
 
-    # Preserve common metadata if present
+    # preserve common metadata 
     for meta_key in ("File", "FormType", "Filename"):
         if meta_key in row:
             out[meta_key] = clean_value(row.get(meta_key))
 
-    # Rewrite PageX_QY -> MD538_PX_QY
+    # rewrite PageX_QY -> MD538_PX_QY
     for k, v in row.items():
         if not k:
             continue
@@ -145,13 +147,13 @@ def remap_to_md538_headers(row):
             new_key = f"MD538_P{page_num}_Q{q_num}"
             out[new_key] = clean_value(v)
         else:
-            # Keep other fields (avoid overwriting preserved metadata)
+            # keep other fields (avoid overwriting preserved metadata)
             if k not in out and k not in ("",):
                 out[k] = clean_value(v)
 
     return out
 
-# ---------- classification (preserved original logic) ----------
+# classification
 
 def _get(row, key):
     val = row.get(key, "")
@@ -159,22 +161,29 @@ def _get(row, key):
         return None
     return val.strip() if isinstance(val, str) else val
 
+def _get_any(row, *keys):
+    for k in keys:
+        v = _get(row, k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v.strip() != "":
+                return v.strip()
+        else:
+            return v
+    return None
+
 def extract_classification_row(row):
-    """
-    Original classification logic:
-      - Reads from the original Page1_Q*, Page2_Q*, Page3_Q* fields
-      - Produces the 10 classification features used by classify.py
-    """
-    # Cargo Type and numeric fields
-    cargo_type_raw = _get(row, 'Page1_Q8')
+    # extract cargo type and numeric fields
+    cargo_type_raw = _get_any(row, "MD538_P1_Q8", "Page1_Q8")
     cargo_type = normalize_cargo_type(cargo_type_raw)
 
-    length = parse_float_safe(_get(row, 'Page1_Q4'))
-    draft  = parse_float_safe(_get(row, 'Page1_Q5'))
+    length = parse_float_safe(_get_any(row, "MD538_P1_Q4", "Page1_Q4"))
+    draft  = parse_float_safe(_get_any(row, "MD538_P1_Q5", "Page1_Q5"))
 
-    # National colors / flag
-    flag_raw = _get(row, 'Page1_Q3')
-    flag_raw_lower = flag_raw.lower() if flag_raw else ""
+    # national colors/flag
+    flag_raw = _get_any(row, "MD538_P1_Q3", "Page1_Q3")
+    flag_raw_lower = flag_raw.lower() if isinstance(flag_raw, str) else ""
     matched_abbrev = None
     for country_name, abbrev in FLAG_ABBREVIATIONS.items():
         if country_name.lower() in flag_raw_lower:
@@ -182,12 +191,12 @@ def extract_classification_row(row):
             break
     flag = matched_abbrev if matched_abbrev else normalize_flag(flag_raw)
 
-    # Hull details
-    hull_raw = _get(row, 'Page3_Q1')
+    # hull details
+    hull_raw = _get_any(row, "MD538_P3_Q1", "Page3_Q1")
     single_hull = False
     double_sides = False
     double_bottoms = False
-    if hull_raw:
+    if isinstance(hull_raw, str) and hull_raw.strip():
         hull_raw_low = hull_raw.lower()
         if 'single hull' in hull_raw_low:
             single_hull = True
@@ -200,10 +209,10 @@ def extract_classification_row(row):
             double_sides = False
             double_bottoms = False
 
-    # Boolean handwritten flags (YES/NO presence)
-    liquefied_gas   = special_bool_field(_get(row, 'Page2_Q1'))
-    oil_over_2000t  = special_bool_field(_get(row, 'Page2_Q2'))
-    noxious_liquid  = special_bool_field(_get(row, 'Page2_Q3'))
+    # boolean handwritten flags (yes/no presence)
+    liquefied_gas   = special_bool_field(_get_any(row, "MD538_P2_Q1", "Page2_Q1"))
+    oil_over_2000t  = special_bool_field(_get_any(row, "MD538_P2_Q2", "Page2_Q2"))
+    noxious_liquid  = special_bool_field(_get_any(row, "MD538_P2_Q3", "Page2_Q3"))
 
     data = {
         'Cargo Type': cargo_type,
@@ -224,7 +233,7 @@ def extract_classification_row(row):
 
     return data
 
-# ---------- MD537 in-place cleaning ----------
+#MD537 processing
 
 MD537_FIELD_PREFIX = "MD537_"
 
@@ -233,14 +242,14 @@ def _is_md537_row(row, form_key: str | None) -> bool:
         ft = str(row.get(form_key, "")).strip().upper()
         if ft.startswith("MD537"):
             return True
-    # Fallback: presence of any MD537_* field
+    # fallback: presence of any MD537_* field
     return any(k.startswith(MD537_FIELD_PREFIX) for k in row.keys())
 
 def _clean_md537_value(key: str, val: str) -> str:
     """Apply MD537-specific cleaning rules to a single cell."""
     v = clean_value(val)
     if key == "MD537_P1_Q3":
-        # Extract only the numeric part; keep as string (empty if none)
+        # extract only the numeric part; keep as string (empty if none)
         m = re.search(r"[-+]?\d*\.?\d+", v.replace(',', '')) if isinstance(v, str) else None
         v = m.group() if m else ""
     return v
@@ -268,11 +277,9 @@ def clean_md537_rows_in_place(rows):
     return cleaned
 
 def _write_results_csv(path: str, rows: list[dict], original_fieldnames: list[str] | None):
-    """
-    Write rows back to results.csv. Keep original header order when possible,
-    but include any new keys that may have appeared.
-    """
-    # Union of keys
+    # write rows back to results.csv. Keep original header order when possible,
+    # but include any new keys that may have appeared.
+    # union of keys
     key_union = []
     def _add_key(k):
         if k not in key_union:
@@ -286,7 +293,7 @@ def _write_results_csv(path: str, rows: list[dict], original_fieldnames: list[st
         for k in r.keys():
             _add_key(k)
 
-    # Write atomically
+    # write atomically
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=key_union)
@@ -295,7 +302,7 @@ def _write_results_csv(path: str, rows: list[dict], original_fieldnames: list[st
             writer.writerow(r)
     os.replace(tmp_path, path)
 
-# ---------- main ----------
+# main
 
 def main():
     input_csv = 'results.csv'
@@ -304,7 +311,7 @@ def main():
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"[extract] {input_csv} not found.")
 
-    # Read results.csv
+    # read results.csv
     with open(input_csv, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         original_headers = reader.fieldnames[:] if reader.fieldnames else None
@@ -312,7 +319,7 @@ def main():
 
     print(f"[extract] Loaded results.csv with {len(all_rows)} total row(s).")
 
-    # 1) Clean MD537 rows in-place and write back to results.csv
+    # 1) clean MD537 rows in-place and write back to results.csv
     cleaned_rows = clean_md537_rows_in_place(all_rows)
     if cleaned_rows != all_rows:
         _write_results_csv(input_csv, cleaned_rows, original_headers)
@@ -320,11 +327,11 @@ def main():
     else:
         print("[extract] No MD537 rows found to clean (results.csv unchanged).")
 
-    # 2) Preserve existing behavior: filter MD538 rows and create input.csv for classification
+    # 2) preserve existing behavior: filter MD538 rows and create input.csv for classification
     rows_for_md538 = _filter_md538_rows(cleaned_rows)
     print(f"[extract] Retained {len(rows_for_md538)} MD538 row(s) for classification.")
 
-    # Build transformed rows that include:
+    # build transformed rows that include:
     #   - MD538_P… remapped columns
     #   - original classification features (Cargo Type, etc.)
     transformed = []
@@ -334,14 +341,14 @@ def main():
         merged = {**md538_side, **cls_side}
         transformed.append(merged)
 
-    # Build a stable header order for input.csv:
-    #   1) Metadata first (if present)
-    #   2) MD538_P{page}_Q{q} columns sorted by page then q
-    #   3) Classification columns (fixed order)
-    #   4) Any remaining extra fields in encounter order
+    # order for input.csv:
+    #   1) Metadata first   
+    #   2) md538_p{page}_q{q} columns sorted by page then q
+    #   3) classification columns (fixed order)
+    #   4) any remaining extra fields in encounter order
     meta_order = [k for k in ("File", "FormType", "Filename") if any(k in r for r in transformed)]
 
-    # Collect MD538 question keys
+    # collect md538 question keys
     md538_keys = set()
     extras_in_order = []
     for r in transformed:
@@ -375,7 +382,7 @@ def main():
         + [k for k in extras_in_order if k not in md538_sorted and k not in classification_headers]
     )
 
-    # Always write input.csv, even if empty (header only)
+    # always write input.csv, even if empty (header only)
     with open(output_csv, 'w', newline='', encoding='utf-8') as f_out:
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
         writer.writeheader()

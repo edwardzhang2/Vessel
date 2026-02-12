@@ -1,4 +1,3 @@
-# server.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 import tempfile
@@ -65,8 +64,8 @@ def health():
 
 def _pick_artifact(job_dir: Path) -> Path:
     """
-    Prefer a packaged ZIP produced by the pipeline.
-    Fall back to output_*.csv, then results.csv.
+    1. pick a packaged ZIP produced by the pipeline.
+    2. if no ZIP, fall back to output_*.csv, then results.csv.
     """
     zips = sorted(job_dir.glob("job_artifacts_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
     if zips:
@@ -97,8 +96,7 @@ def _zip_contains(zip_path: Path, member_name: str) -> bool:
 
 def _ensure_input_in_zip(zip_path: Path, job_dir: Path) -> None:
     """
-    If job_artifacts_*.zip exists but doesn't contain input.csv,
-    append input.csv from the job_dir (if present).
+    if job_artifacts_*.zip exists but doesn't contain input.csv, append input.csv from the job_dir (if present).
     """
     input_csv = job_dir / "input.csv"
     if not input_csv.exists():
@@ -111,36 +109,36 @@ def _ensure_input_in_zip(zip_path: Path, job_dir: Path) -> None:
             zf.write(input_csv, arcname="input.csv")
     except Exception as e:
         # Non-fatal: if appending fails, we still return the original artifact
-        # You could log this to stdout/stderr if desired.
+        # TODO: log to file
         pass
 
 @app.post("/upload/")
 async def upload_pdf_zip(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+        raise HTTPException(status_code=400, detail="only .zip files are accepted")
 
     if not PIPELINE_PATH.exists():
         raise HTTPException(status_code=500, detail=f"pipeline.py not found at {PIPELINE_PATH}")
 
-    # Create an isolated job workspace under /tmp
+    # create an isolated job workspace under /tmp
     job_dir = Path(tempfile.mkdtemp(prefix="job_"))
     input_dir = job_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Save the uploaded ZIP
+        # save the uploaded ZIP
         zip_path = job_dir / file.filename
         with open(zip_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Extract into input_dir
+        # extract into input_dir
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(input_dir)
         except zipfile.BadZipFile:
             raise HTTPException(status_code=400, detail="Invalid ZIP file")
 
-        # Run pipeline.py with cwd=job_dir so outputs are written into job_dir
+        # run pipeline.py with cwd=job_dir so outputs are written into job_dir
         cmd = [sys.executable, str(PIPELINE_PATH), str(input_dir)]
         proc = subprocess.run(
             cmd,
@@ -151,10 +149,10 @@ async def upload_pdf_zip(file: UploadFile = File(...)):
         )
 
         if proc.returncode != 0:
-            # Pass through pipeline stdout in the error for easier debugging
+            # pass through pipeline stdout in the error for easier debugging
             raise HTTPException(status_code=500, detail=f"Pipeline failed:\n{proc.stderr or proc.stdout}")
 
-        # Prefer ZIP, then CSVs
+        # prefer ZIP, then CSVs
         try:
             artifact = _pick_artifact(job_dir)
         except FileNotFoundError:
@@ -163,7 +161,7 @@ async def upload_pdf_zip(file: UploadFile = File(...)):
                 detail=f"No artifact found in {job_dir}.\nStdout:\n{proc.stdout}\nStderr:\n{proc.stderr}"
             )
 
-        # If artifact is a ZIP, make sure input.csv is inside (append if missing)
+        # if artifact is a ZIP, make sure input.csv is inside (append if missing)
         if artifact.suffix.lower() == ".zip":
             _ensure_input_in_zip(artifact, job_dir)
 
@@ -175,6 +173,6 @@ async def upload_pdf_zip(file: UploadFile = File(...)):
         )
 
     finally:
-        # Keep artifacts for debugging. Uncomment to auto-clean:
+        # keep artifacts for debugging. uncomment to auto-clean:
         # shutil.rmtree(job_dir, ignore_errors=True)
         pass
